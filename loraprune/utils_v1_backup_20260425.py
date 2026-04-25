@@ -177,19 +177,11 @@ def update_sensitivity_dict(model, s_dict, prune_metric):
         sensitivity = compute_sensitivity(module, is_attn, is_output, intermediate,
                                          prune_metric, head_dim=head_dim)
         if is_attn:
-            # 注意力层：key 去掉最后 2 级（q_proj/k_proj... → self_attn 或 attention）
-            s_name = ".".join(name.split('.')[:-2])
-        else:
-            # FFN 层（gate_proj/up_proj/down_proj/intermediate.dense 等）：
-            # init_sensitivity_dict 保留完整名，此处需同样保留完整名进行累加
-            s_name = name
-
-        # 同时写入注意力层和 FFN 层（F2 修复：之前只有 is_attn 分支写入）
-        if s_name in new_s_dict:
-            new_s_dict[s_name] += sensitivity.to(new_s_dict[s_name].device)
-        else:
-            # 若 key 不存在（可能是架构差异导致），打印警告并跳过，避免 KeyError
-            print(f"[update_sensitivity_dict] Warning: key '{s_name}' not found in new_s_dict, skipping.")
+            name = ".".join(name.split('.')[:-2])
+            # else:
+            #     name = ".".join(name.split('.')[:-1])
+            # 存储敏感分数
+            new_s_dict[name] += sensitivity.to(new_s_dict[name].device)
 
     # 检查敏感分数是否包含 NaN
     if any(torch.isnan(imp.sum()) for imp in new_s_dict.values()):
@@ -263,22 +255,13 @@ def prune_fp16_module(module, mask, transpose):
     module.merge_weights = True
     module.train(False)
 
-def prune_one_layer(layer, head_dim=128):
-    """对单层执行结构剪枝。
-
-    Args:
-        layer: Transformer 层对象（须含 self_attn 和 mlp 子模块）
-        head_dim: 每个注意力头的维度，默认 128（LLaMA/Mistral）。
-                  BERT/ViT 应传入 64。
-                  由调用方 prune() 从 model.config 动态获取并传入。
-    """
+def prune_one_layer(layer):
     ## self_attn
     prune_fp16_module(layer.self_attn.q_proj, layer.self_attn.q_proj.lora_mask, False)
     prune_fp16_module(layer.self_attn.k_proj, layer.self_attn.k_proj.lora_mask, False)
     prune_fp16_module(layer.self_attn.v_proj, layer.self_attn.v_proj.lora_mask, False)
     prune_fp16_module(layer.self_attn.o_proj, layer.self_attn.q_proj.lora_mask, True)
-    # F3 修复：不再引用已删除的全局 DIM，改为使用动态传入的 head_dim
-    layer.self_attn.num_heads = int(layer.self_attn.q_proj.lora_mask.sum()) // head_dim
+    layer.self_attn.num_heads = int(layer.self_attn.q_proj.lora_mask.sum()) // DIM
     layer.self_attn.hidden_size = int(layer.self_attn.q_proj.lora_mask.sum())
 
     ## mlp
@@ -294,13 +277,9 @@ def prune_one_layer(layer, head_dim=128):
     del(layer.mlp.up_proj.lora_mask)
 
 def prune(model):
-    # F3 修复：动态获取 head_dim，避免硬编码 DIM=64 对 LLaMA(128) 失效
-    hidden_size = model.config.hidden_size
-    num_attention_heads = getattr(model.config, 'num_attention_heads', 12)
-    head_dim = hidden_size // num_attention_heads
     for layer_id, layer in enumerate(model.model.model.layers):
         print("pruning layer {}".format(layer_id))
-        prune_one_layer(layer, head_dim=head_dim)
+        prune_one_layer(layer)
 
 # def local_prune(model, s_dict, ratio, target_ratio):
 #     original_param_num = 0
@@ -362,11 +341,6 @@ def local_prune(model, s_dict, ratio, target_ratio, mask_dict=None):
     if mask_dict is None:
         mask_dict = {}
 
-    # F3 修复：动态获取 head_dim，替换已删除的全局 DIM=64
-    hidden_size = model.config.hidden_size
-    num_attention_heads = getattr(model.config, 'num_attention_heads', 12)
-    head_dim = hidden_size // num_attention_heads
-
     original_param_num = 0
     pruned_param_num = 0
 
@@ -394,9 +368,9 @@ def local_prune(model, s_dict, ratio, target_ratio, mask_dict=None):
             # 计算需要剪枝的数量
             total_num = current_mask.numel()
             if is_attn:
-                mask = mask.reshape(-1, head_dim)[:, 0]
-                current_mask = current_mask.reshape(-1, head_dim)[:, 0]
-                total_num //= head_dim
+                mask =mask.reshape(-1, DIM)[:, 0]
+                current_mask = current_mask.reshape(-1, DIM)[:, 0]
+                total_num //= DIM
             need_prune_num = int(total_num * ratio)
 
             # 根据当前掩码计算有效重要性
@@ -409,7 +383,7 @@ def local_prune(model, s_dict, ratio, target_ratio, mask_dict=None):
             mask[can_prune] = 0
 
             if is_attn:
-                mask = (mask.new_ones(module.weight.shape[0]).reshape(-1, head_dim) * mask.unsqueeze(1)).reshape(-1)
+                mask = (mask.new_ones(module.weight.shape[0]).reshape(-1, DIM) * mask.unsqueeze(1)).reshape(-1)
             mask_dict[name] = mask
             # 更新剪枝统计
             pruned_param_num += mask.sum().item() 
@@ -452,11 +426,6 @@ def global_prune(model, s_dict, ratio, target_ratio, mask_dict=None):
     if mask_dict is None:
         mask_dict = {}
 
-    # F3 修复：动态获取 head_dim，替换已删除的全局 DIM=64
-    hidden_size = model.config.hidden_size
-    num_attention_heads = getattr(model.config, 'num_attention_heads', 12)
-    head_dim = hidden_size // num_attention_heads
-
     attn_scores = []  # 存储注意力层的重要性分数
     ffn_scores = []   # 存储 FFN 层的重要性分数
     attn_info = []    # 记录注意力层模块信息
@@ -490,8 +459,8 @@ def global_prune(model, s_dict, ratio, target_ratio, mask_dict=None):
                 print(f"Warning: {name} has empty importance scores in s_dict, skipping")
                 continue
 
-            if current_mask.numel() % head_dim == 0:
-                valid_heads = current_mask.reshape(-1, head_dim).any(dim=1)
+            if current_mask.numel() % DIM == 0:
+                valid_heads = current_mask.reshape(-1, DIM).any(dim=1)
             else:
                 print(f"Warning: {name} mask shape mismatch, using default valid_heads")
                 valid_heads = torch.ones_like(head_importances, dtype=torch.bool)
@@ -550,7 +519,7 @@ def global_prune(model, s_dict, ratio, target_ratio, mask_dict=None):
 
         if prune_type == 'head' and global_threshold_attn is not None:
             head_mask = scores <= global_threshold_attn.to(scores.device)
-            mask = head_mask.repeat_interleave(head_dim)
+            mask = head_mask.repeat_interleave(DIM)
 
         elif prune_type == 'ffn' and global_threshold_ffn is not None:
             param_mask = scores <= global_threshold_ffn.to(scores.device)
@@ -966,34 +935,12 @@ def balanced_pruning(
             mask_dict[key+'.value'] = mask.repeat_interleave(DIM)
             mask_dict[key+'.output.dense'] = mask.repeat_interleave(DIM)
         # LLaMA/Mistral/Qwen 等架构：掩码展开到 q/k/v/o_proj
-        # F1 修复：正确处理 GQA（LLaMA-2 等）K/V head 数量与 Q 不同的情况
         if "self_attn" in key and model.config.model_type in ('llama', 'mistral', 'qwen', 'gpt2', 'gpt_neox'):
             head_dim = model.config.hidden_size // model.config.num_attention_heads
-            # Q 头数 = num_attention_heads（全量头）
-            num_q_heads = model.config.num_attention_heads
-            # K/V 头数：GQA 使用 num_key_value_heads，MHA 时与 Q 相同
-            num_kv_heads = getattr(model.config, 'num_key_value_heads', num_q_heads)
-
-            if num_kv_heads == num_q_heads:
-                # MHA（标准多头注意力）：Q/K/V/O 头数一致，直接 repeat_interleave
-                mask_dict[key+'.q_proj'] = mask.repeat_interleave(head_dim)
-                mask_dict[key+'.k_proj'] = mask.repeat_interleave(head_dim)
-                mask_dict[key+'.v_proj'] = mask.repeat_interleave(head_dim)
-                mask_dict[key+'.o_proj'] = mask.repeat_interleave(head_dim)
-            else:
-                # GQA（分组查询注意力）：K/V 只有 num_kv_heads 个头
-                # mask 长度 = num_q_heads；需要将其下采样到 num_kv_heads 再展开
-                # 策略：每 (num_q_heads // num_kv_heads) 个 Q 头对应 1 个 KV 头
-                #       KV 头存活 ↔ 对应的任意一个 Q 头存活（any 规则）
-                group_size = num_q_heads // num_kv_heads
-                kv_mask = mask.view(num_kv_heads, group_size).any(dim=1).float()
-                mask_dict[key+'.q_proj'] = mask.repeat_interleave(head_dim)       # [num_q_heads * head_dim]
-                mask_dict[key+'.k_proj'] = kv_mask.repeat_interleave(head_dim)    # [num_kv_heads * head_dim]
-                mask_dict[key+'.v_proj'] = kv_mask.repeat_interleave(head_dim)    # [num_kv_heads * head_dim]
-                mask_dict[key+'.o_proj'] = mask.repeat_interleave(head_dim)       # [num_q_heads * head_dim]
-                print(f"[GQA] {key}: Q_heads={num_q_heads}, KV_heads={num_kv_heads}, "
-                      f"q_mask={mask_dict[key+'.q_proj'].shape}, "
-                      f"kv_mask={mask_dict[key+'.k_proj'].shape}")
+            mask_dict[key+'.q_proj'] = mask.repeat_interleave(head_dim)
+            mask_dict[key+'.k_proj'] = mask.repeat_interleave(head_dim)
+            mask_dict[key+'.v_proj'] = mask.repeat_interleave(head_dim)
+            mask_dict[key+'.o_proj'] = mask.repeat_interleave(head_dim)
         # print(mask_dict[key].shape)
         # s_name= ''
         # for name, module in model.named_modules():

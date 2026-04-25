@@ -392,7 +392,7 @@ class LoRAPruneTrainer(Trainer):
                                 # print("Applying mask to layer:", mask.sum(), mask.shape)
                                 # 根据层的类型调整掩码形状
 
-                                if 'attention' in layer_name:
+                                if 'self_attn' in layer_name or 'attention' in layer_name:
                                     # s_name = ".".join(layer_name.split('.')[:-2])
                                     mask = mask_dict[layer_name].to(output.device)
                                     # 对于注意力层，调整掩码形状以匹配输出
@@ -400,14 +400,14 @@ class LoRAPruneTrainer(Trainer):
                                     seq_len = output.size(1)
                                     head_dim = output.size(-1) // mask.size(0)
                                     # print(f'Applying mask to {layer_name} with shape {mask.shape} and output shape {output.shape}')
-                                        
+
                                     # 将掩码扩展到正确的维度 [num_heads] -> [batch_size, seq_len, num_heads, head_dim]
                                     mask = mask.view(-1, 1).repeat(1, head_dim)  # [num_heads, head_dim]
                                     mask = mask.view(1, 1, -1).expand(batch_size, seq_len, -1)
-                                        
-                                elif 'output' in layer_name or 'intermediate' in layer_name:
-                                    # 对于输出层和中间层，调整掩码形状
-                                    mask = mask.view(1, 1, -1)  # 变成 [1, 1, 3072]
+
+                                elif 'mlp' in layer_name or 'output' in layer_name or 'intermediate' in layer_name:
+                                    # 对于 FFN 层（BERT: output/intermediate；LLaMA: mlp.gate/up/down_proj）
+                                    mask = mask.view(1, 1, -1)  # [1, 1, hidden_size/ffn_size]
                                 # 使用广播机制应用掩码
                                 # print(f'Applying mask to {name} with shape {m ask.shape} and output shape {output.shape}')
                                 ## 只在真正 optimizer 更新时才应用
@@ -721,9 +721,11 @@ class LoRAPruneTrainer(Trainer):
                             
                             # 根据配置存储相应组件的重要性分数
                             for k, v in s_dict.items():
-                                # 分析模块类型
-                                is_attention = 'attention' in k
-                                is_ffn = 'intermediate' in k or 'output' in k  # FFN层通常包含intermediate和output
+                                # 分析模块类型（兼容 BERT/ViT + LLaMA/Mistral/Qwen）
+                                # BERT/ViT: key 包含 'attention'；LLaMA: key 包含 'self_attn'
+                                is_attention = 'attention' in k or 'self_attn' in k
+                                # BERT: 'intermediate' 或 'output'；LLaMA: 'mlp'（不含 self_attn）
+                                is_ffn = 'mlp' in k or 'intermediate' in k or 'output' in k
                                 
                                 # 根据配置决定是否收集该组件
                                 should_collect = (is_attention and 'attention' in self.stability_components) or \
@@ -735,16 +737,13 @@ class LoRAPruneTrainer(Trainer):
                                     # 存储当前步骤的重要性分数
                                     self.collected_importances[k].append(v.detach().cpu().numpy().reshape(-1))
                             
-                            # 打印收集状态
+                            # 打印收集状态（兼容 LLaMA：注意力含 self_attn，FFN 含 mlp）
                             if self.state.global_step % 10 == 0:  # 每10步打印一次
-                                collected_attn_count = sum(len(v) for k, v in self.collected_importances.items() if 'attention' in k)
-                                collected_ffn_count = sum(len(v) for k, v in self.collected_importances.items() if 'intermediate' in k or 'output' in k)
-                                # print(f"[稳定性采集] step={self.state.global_step}, 已收集 {collected_attn_count} 条注意力头和 {collected_ffn_count} 条FFN层重要性分数记录")
-                        
+                                collected_attn_count = sum(len(v) for k, v in self.collected_importances.items() if 'self_attn' in k or 'attention' in k)
+                                collected_ffn_count = sum(len(v) for k, v in self.collected_importances.items() if 'mlp' in k or 'intermediate' in k or 'output' in k)
+
                         except Exception as e:
                             print(f"[稳定性采集] 收集阶段失败: {e}")
-                    
-                    # 应用阶段：在剪枝周期的最后一步计算稳定性并应用于下一次剪枝
                     if stability_apply_phase and self.collected_importances:
                         try:
                             print(f"[稳定性应用] step={self.state.global_step}, 开始计算稳定性并更新敏感度字典")
@@ -759,8 +758,8 @@ class LoRAPruneTrainer(Trainer):
                             # 计算每个模块的稳定性
                             for module_name, importances_list in self.collected_importances.items():
                                 if len(importances_list) >= 3:  # 至少需要3个样本才能计算稳定性
-                                    # 确定模块类型
-                                    module_type = "attention" if "attention" in module_name else "ffn"
+                                    # 确定模块类型（兼容 BERT/ViT + LLaMA）
+                                    module_type = "attention" if ("attention" in module_name or "self_attn" in module_name) else "ffn"
                                     
                                     # 将列表转换为numpy数组 [num_samples, num_heads/neurons]
                                     importances = np.stack(importances_list, axis=0)
@@ -1393,9 +1392,9 @@ class LoRAPruneTrainer(Trainer):
             save_dir = self.args.output_dir
         os.makedirs(save_dir, exist_ok=True)
         
-        # 按类型分组
-        attention_modules = {k: v for k, v in self.stability_stats.items() if 'attention' in k}
-        ffn_modules = {k: v for k, v in self.stability_stats.items() if 'intermediate' in k or 'output' in k}
+        # 按类型分组（兼容 BERT/ViT + LLaMA）
+        attention_modules = {k: v for k, v in self.stability_stats.items() if 'attention' in k or 'self_attn' in k}
+        ffn_modules = {k: v for k, v in self.stability_stats.items() if 'mlp' in k or 'intermediate' in k or 'output' in k}
         
         # 保存分布数据
         step = self.state.global_step

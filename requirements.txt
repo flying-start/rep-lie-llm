@@ -1,0 +1,165 @@
+# ============================================================
+# REP-LIE — LLM 剪枝项目依赖清单
+# 目标平台：AutoDL RTX A4000 (16GB VRAM × 2) / CUDA 12.1
+# Python 版本：3.10+
+# 生成日期：2026-04-25
+# ============================================================
+#
+# 【数据盘路径说明】
+#   AutoDL 数据盘挂载点：/root/autodl-tmp/
+#   建议运行前设置以下环境变量：
+#
+#     export HF_HOME=/root/autodl-tmp/hf_cache
+#     export HF_DATASETS_CACHE=/root/autodl-tmp/hf_cache/datasets
+#     export TRANSFORMERS_CACHE=/root/autodl-tmp/hf_cache/transformers
+#     export TORCH_HOME=/root/autodl-tmp/torch_cache
+#     export MODELSCOPE_CACHE=/root/autodl-tmp/modelscope_cache
+#
+#   或在代码入口处添加（main_llm.py 顶部）：
+#     import os
+#     os.environ["HF_HOME"] = "/root/autodl-tmp/hf_cache"
+#     os.environ["HF_DATASETS_CACHE"] = "/root/autodl-tmp/hf_cache/datasets"
+#     os.environ["TRANSFORMERS_CACHE"] = "/root/autodl-tmp/hf_cache/transformers"
+#
+#   模型文件建议存放路径：
+#     /root/autodl-tmp/models/llama2-7b-hf/
+#     /root/autodl-tmp/models/mistral-7b-hf/
+#     /root/autodl-tmp/datasets/
+#
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 1. PyTorch（必须与 CUDA 版本匹配，CUDA 12.1 使用以下版本）
+# ------------------------------------------------------------
+# 注意：直接 pip install 会下载 CPU 版，建议用官方命令安装：
+#   pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cu121
+torch==2.2.2
+torchvision==0.17.2
+
+# ------------------------------------------------------------
+# 2. HuggingFace 核心库（LLM 加载关键版本）
+# ------------------------------------------------------------
+# transformers >= 4.37 才支持 LLaMA-3 / Qwen2 / GQA 相关接口
+# transformers >= 4.40 支持 Qwen2DecoderLayer
+transformers==4.40.2
+
+# peft >= 0.10 支持 MaskedModuleWrapper（代码中直接导入此类）
+# peft >= 0.9  支持 LoraConfig TaskType.CAUSAL_LM
+peft==0.10.0
+
+# datasets >= 2.18 支持 C4 流式加载
+datasets==2.19.1
+
+# accelerate >= 0.28 支持 get_balanced_memory / infer_auto_device_map
+accelerate==0.29.3
+
+# huggingface_hub（peft_model.py 中 hf_hub_download）
+huggingface_hub==0.22.2
+
+# evaluate（指标计算：accuracy / perplexity）
+evaluate==0.4.1
+
+# ------------------------------------------------------------
+# 3. 量化相关（4-bit/8-bit 推理必须）
+# ------------------------------------------------------------
+# bitsandbytes >= 0.43 支持 CUDA 12.1 + A4000
+# bitsandbytes >= 0.39 支持 BitsAndBytesConfig + 4-bit NF4
+bitsandbytes==0.43.1
+
+# loralib（finetune.py / finetune_peft.py 中 import loralib as lora）
+loralib==0.1.2
+
+# ------------------------------------------------------------
+# 4. FLOPs 统计
+# ------------------------------------------------------------
+# fvcore（trainer_FLOPs.py 中 FlopCountAnalysis）
+fvcore==0.1.5.post20221221
+
+# thop（trainer_utils.py 中 thop.profile）
+thop==0.1.1.post2209072238
+
+# ------------------------------------------------------------
+# 5. 模型压缩框架（NNI）
+# ------------------------------------------------------------
+# ⚠️  警告：代码中使用了非标准 NNI API：
+#    TaylorPruner_change / TaylorPrunerWithDelta / TaylorPrunerWithDelta1
+#    标准 pip install nni 中 **不包含** 这些类，需使用本地魔改版 NNI。
+#
+# 若仅运行 LLM 剪枝（main_llm.py），可跳过 nni，
+# 仅 main8.py + compression/ 目录依赖 nni。
+#
+# 标准安装（可能部分功能缺失）：
+# nni==3.0
+#
+# 推荐：使用项目内本地 nni（如有），或注释掉此行并从源码安装：
+# git clone https://github.com/microsoft/nni && pip install -e nni/
+nni==3.0
+
+# ------------------------------------------------------------
+# 6. 超参搜索（test2.py，非核心路径）
+# ------------------------------------------------------------
+# ray[tune] >= 2.9 兼容新版 TuneConfig / Tuner API
+ray[tune]==2.10.0
+
+# optuna（贝叶斯超参搜索）
+optuna==3.6.1
+
+# ------------------------------------------------------------
+# 7. 图像处理（data_utils.py / data_utils_llm.py）
+# ------------------------------------------------------------
+# opencv-python（cv2）
+opencv-python==4.9.0.80
+
+# ------------------------------------------------------------
+# 8. 科学计算工具
+# ------------------------------------------------------------
+numpy==1.26.4
+scikit-learn==1.4.2
+
+# ------------------------------------------------------------
+# 9. 工具库
+# ------------------------------------------------------------
+tqdm==4.66.2
+
+# ------------------------------------------------------------
+# 10. Tokenizer 底层依赖（transformers 依赖，建议显式锁定）
+# ------------------------------------------------------------
+sentencepiece==0.2.0
+tokenizers==0.19.1
+safetensors==0.4.3
+protobuf==4.25.3
+
+# ------------------------------------------------------------
+# 11. 可选：LLM 基准评测
+# ------------------------------------------------------------
+# lm_eval（评测报告中引用，正式代码未 import，需要时安装）
+# lm-evaluation-harness @ git+https://github.com/EleutherAI/lm-evaluation-harness.git
+
+# ------------------------------------------------------------
+# 12. 可选：可视化（README_stability_experiment.md 示例代码）
+# ------------------------------------------------------------
+# matplotlib==3.8.4
+
+# ============================================================
+# 快速安装命令（复制粘贴到服务器终端）
+# ============================================================
+#
+# Step 1: 安装 PyTorch（CUDA 12.1）
+#   pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cu121
+#
+# Step 2: 安装其余依赖
+#   pip install -r requirements.txt --ignore-requires-python
+#
+# Step 3: 验证 CUDA 可用
+#   python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+#
+# Step 4: 验证 bitsandbytes
+#   python -c "import bitsandbytes; bitsandbytes.cuda_setup.main()"
+#
+# Step 5: 配置数据盘（每次登录服务器后执行，或加入 ~/.bashrc）
+#   export HF_HOME=/root/autodl-tmp/hf_cache
+#   export HF_DATASETS_CACHE=/root/autodl-tmp/hf_cache/datasets
+#   export TRANSFORMERS_CACHE=/root/autodl-tmp/hf_cache/transformers
+#
+# ============================================================
