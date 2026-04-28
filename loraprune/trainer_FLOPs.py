@@ -1,4 +1,10 @@
 from transformers.trainer import *
+try:
+    from transformers.trainer import is_torch_tpu_available
+except ImportError:
+    # transformers 4.36+ 将该函数移至 training_args 或移除
+    def is_torch_tpu_available():
+        return False
 import loraprune.utils as utils
 import loraprune.utils1 as utils1
 from peft.tuners.lora import Linear
@@ -11,6 +17,7 @@ from copy import deepcopy
 import gc
 import types
 import re
+import math
 
 class LoRAPruneTrainer(Trainer):
     def __init__(self, model,
@@ -463,10 +470,10 @@ class LoRAPruneTrainer(Trainer):
                 debug_overflow = DebugUnderflowOverflow(self.model)  # noqa
 
         delay_optimizer_creation = (
-            self.sharded_ddp is not None
-            and self.sharded_ddp != ShardedDDPOption.SIMPLE
+            getattr(self, 'sharded_ddp', None) is not None
+            and getattr(self, 'sharded_ddp', None) != ShardedDDPOption.SIMPLE
             or is_sagemaker_mp_enabled()
-            or self.fsdp is not None
+            or getattr(self, 'fsdp', None) is not None
         )
         if args.deepspeed:
             deepspeed_engine, optimizer, lr_scheduler = deepspeed_init(
@@ -659,7 +666,7 @@ class LoRAPruneTrainer(Trainer):
                 self.current_flos += float(self.floating_point_ops(inputs))
 
                 # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
-                if self.deepspeed:
+                if getattr(self, 'deepspeed', None):
                     self.deepspeed.step()
 
                 if total_batched_samples % args.gradient_accumulation_steps == 0 or (
@@ -668,30 +675,33 @@ class LoRAPruneTrainer(Trainer):
                     and (step + 1) == steps_in_epoch
                 ):
                     # Gradient clipping
-                    if args.max_grad_norm is not None and args.max_grad_norm > 0 and not self.deepspeed:
+                    grad_norm: float | None = None
+                    if args.max_grad_norm is not None and args.max_grad_norm > 0 and not getattr(self, 'deepspeed', None):
                         # deepspeed does its own clipping
 
-                        if self.do_grad_scaling:
+                        if getattr(self, 'do_grad_scaling', False):
                             # AMP: gradients need unscaling
-                            self.scaler.unscale_(self.optimizer)
+                            scaler = getattr(self, 'scaler', None)
+                            if scaler is not None:
+                                scaler.unscale_(self.optimizer)
 
                         if is_sagemaker_mp_enabled() and args.fp16:
-                            self.optimizer.clip_master_grads(args.max_grad_norm)
+                            grad_norm = self.optimizer.clip_master_grads(args.max_grad_norm)
                         elif hasattr(self.optimizer, "clip_grad_norm"):
                             # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
-                            self.optimizer.clip_grad_norm(args.max_grad_norm)
+                            grad_norm = self.optimizer.clip_grad_norm(args.max_grad_norm)
                         elif hasattr(model, "clip_grad_norm_"):
                             # Some models (like FullyShardedDDP) have a specific way to do gradient clipping
-                            model.clip_grad_norm_(args.max_grad_norm)
+                            grad_norm = model.clip_grad_norm_(args.max_grad_norm)
                         else:
                             # Revert to normal clipping otherwise, handling Apex or full precision
-                            nn.utils.clip_grad_norm_(
+                            grad_norm = nn.utils.clip_grad_norm_(
                                 amp.master_params(self.optimizer) if self.use_apex else model.parameters(),
                                 args.max_grad_norm,
                             )
 
                     # Optimizer step
-                    if not self.deepspeed:
+                    if not getattr(self, 'deepspeed', None):
                         # print("prune_metric", self.prune_metric)
                         sensitivity_dict = self.update_sensitivity_with_profile(model, sensitivity_dict, self.prune_metric)
                         # print("sensitivity_dict", sensitivity_dict)
@@ -923,20 +933,25 @@ class LoRAPruneTrainer(Trainer):
                     #     # print("apply_masked_modules")
                     #     apply_masked_modules(model, self.masks)
                     optimizer_was_run = True
-                    if self.deepspeed:
+                    _deepspeed = getattr(self, 'deepspeed', None)
+                    if _deepspeed:
                         pass  # called outside the loop
-                    elif self.do_grad_scaling:
-                        scale_before = self.scaler.get_scale()
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                        scale_after = self.scaler.get_scale()
-                        optimizer_was_run = scale_before <= scale_after
+                    elif getattr(self, 'do_grad_scaling', False):
+                        scaler = getattr(self, 'scaler', None)
+                        if scaler is not None:
+                            scale_before = scaler.get_scale()
+                            scaler.step(self.optimizer)
+                            scaler.update()
+                            scale_after = scaler.get_scale()
+                            optimizer_was_run = scale_before <= scale_after
+                        else:
+                            self.optimizer.step()
                     else:
                         self.optimizer.step()
                     # if self.masks is not None:
                         # print("Applying mask after optimizer step")
                         # utils1.apply_model_mask(model, self.masks)
-                    if optimizer_was_run and not self.deepspeed:
+                    if optimizer_was_run and not _deepspeed:
                         self.lr_scheduler.step()
 
                     model.zero_grad()
@@ -944,7 +959,8 @@ class LoRAPruneTrainer(Trainer):
                     self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
-                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
+                    self._maybe_log_save_evaluate(tr_loss, grad_norm, model, trial, epoch,
+                                                  ignore_keys_for_eval=ignore_keys_for_eval)
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
@@ -959,7 +975,8 @@ class LoRAPruneTrainer(Trainer):
                 self.control.should_training_stop = True
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
-            self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
+            self._maybe_log_save_evaluate(tr_loss, grad_norm, model, trial, epoch,
+                                         ignore_keys_for_eval=ignore_keys_for_eval)
 
 
             if self.control.should_training_stop:
@@ -1066,6 +1083,16 @@ class LoRAPruneTrainer(Trainer):
         }
         
         try:
+            # 0. 收集评估指标（PPL等）
+            eval_metrics = {}
+            for log_entry in self.state.log_history:
+                if 'eval_loss' in log_entry:
+                    eval_metrics['eval_loss'] = log_entry['eval_loss']
+                if 'eval_ppl' in log_entry:
+                    eval_metrics['eval_ppl'] = log_entry['eval_ppl']
+                if 'eval_runtime' in log_entry:
+                    eval_metrics['eval_runtime'] = log_entry['eval_runtime']
+            
             # 1. 从训练指标中获取总训练时间
             metrics_dict = self.state.log_history[-1] if self.state.log_history else {}
             if 'train_runtime' in metrics_dict:
@@ -1198,19 +1225,24 @@ class LoRAPruneTrainer(Trainer):
                 print(f"\n测量 {method} 方法的性能指标...")
                 
                 # 进行测量
-                perf = measure_method_performance(model, method, sensitivity_dict, iterations)
+                perf_time = measure_method_performance(model, method, sensitivity_dict, iterations)
+                perf_time_ms = perf_time * 1000  # 转换为毫秒
+                
+                # 获取实际的内存使用统计
+                perf_memory = self.perf_stats.get('memory_usage', 0.0)
+                perf_peak = self.perf_stats.get('peak_memory', 0.0)
                 
                 # 保存结果
-                stats[method]['avg_time_per_step'] = perf
-                stats[method]['avg_memory'] = perf
-                stats[method]['peak_memory'] = perf
+                stats[method]['avg_time_per_step'] = perf_time_ms
+                stats[method]['avg_memory'] = perf_memory if perf_memory > 0 else 0.01
+                stats[method]['peak_memory'] = perf_peak if perf_peak > 0 else 0.01
                 
                 # FLOPs已经在之前估算
                 stats[method]['flops'] = importance_flops[method] / 1e9  # 转换为GFLOPs
                 
-                print(f"  平均时间: {perf:.2f}ms/步")
-                print(f"  平均内存: {perf:.2f}MB")
-                print(f"  峰值内存: {perf:.2f}MB")
+                print(f"  平均时间: {perf_time_ms:.2f}ms/步")
+                print(f"  平均内存: {stats[method]['avg_memory']:.2f}MB")
+                print(f"  峰值内存: {stats[method]['peak_memory']:.2f}MB")
                 print(f"  估计FLOPs: {stats[method]['flops']:.4f}GFLOPs")
             
             # 生成性能报告
@@ -1221,7 +1253,27 @@ class LoRAPruneTrainer(Trainer):
             report += f"总训练步数: {train_stats['total_steps']}\n"
             report += f"总训练轮数: {train_stats['total_epochs']:.2f}\n"
             report += f"使用的剪枝方法: {current_method}\n"
-            report += f"总训练时间: {train_stats['total_training_time']:.2f}秒\n\n"
+            report += f"总训练时间: {train_stats['total_training_time']:.2f}秒\n"
+            
+            # 添加模型性能指标
+            if eval_metrics:
+                report += "\n模型性能指标:\n"
+                report += "-" * 60 + "\n"
+                if 'eval_loss' in eval_metrics:
+                    report += f"最终验证损失: {eval_metrics['eval_loss']:.4f}\n"
+                if 'eval_ppl' in eval_metrics:
+                    report += f"最终验证困惑度(PPL): {eval_metrics['eval_ppl']:.2f}\n"
+                if 'eval_runtime' in eval_metrics:
+                    report += f"评估耗时: {eval_metrics['eval_runtime']:.2f}秒\n"
+                # 计算PPL改进（如果有初始PPL记录）
+                first_eval_loss = None
+                for log_entry in self.state.log_history:
+                    if 'eval_loss' in log_entry and first_eval_loss is None:
+                        first_eval_loss = log_entry['eval_loss']
+                if first_eval_loss and 'eval_loss' in eval_metrics:
+                    ppl_improvement = math.exp(first_eval_loss) / math.exp(eval_metrics['eval_loss'])
+                    report += f"PPL改善倍数: {ppl_improvement:.2f}x\n"
+            report += "\n"
             
             # 2. 时间开销分布
             report += "时间开销分布:\n"
@@ -1297,11 +1349,25 @@ class LoRAPruneTrainer(Trainer):
             report += f"{'方法':<10} | {'计算时间':<15} | {'内存使用':<15} | {'峰值内存':<15} | {'估计FLOPs':<15}\n"
             report += "-" * 80 + "\n"
             
+            # 检查基准方法是否有有效数据
+            baseline_stats = stats.get(baseline_method, {})
+            baseline_time = baseline_stats.get('avg_time_per_step', 0.0)
+            baseline_memory = baseline_stats.get('avg_memory', 0.0)
+            baseline_peak = baseline_stats.get('peak_memory', 0.0)
+            baseline_flops = baseline_stats.get('flops', 0.0)
+            
             for method in methods:
-                rel_time = stats[method]['avg_time_per_step'] / stats[baseline_method]['avg_time_per_step']
-                rel_memory = stats[method]['avg_memory'] / stats[baseline_method]['avg_memory']
-                rel_peak = stats[method]['peak_memory'] / stats[baseline_method]['peak_memory']
-                rel_flops = stats[method]['flops'] / stats[baseline_method]['flops']
+                method_stats = stats.get(method, {})
+                method_time = method_stats.get('avg_time_per_step', 0.0)
+                method_memory = method_stats.get('avg_memory', 0.0)
+                method_peak = method_stats.get('peak_memory', 0.0)
+                method_flops = method_stats.get('flops', 0.0)
+                
+                # 避免除零错误
+                rel_time = method_time / baseline_time if baseline_time > 0 else 0.0
+                rel_memory = method_memory / baseline_memory if baseline_memory > 0 else 0.0
+                rel_peak = method_peak / baseline_peak if baseline_peak > 0 else 0.0
+                rel_flops = method_flops / baseline_flops if baseline_flops > 0 else 0.0
                     
                 report += f"{method:<10} | {rel_time:<15.2f}x | {rel_memory:<15.2f}x | {rel_peak:<15.2f}x | {rel_flops:<15.2f}x\n"
             

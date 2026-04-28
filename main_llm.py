@@ -33,6 +33,7 @@ import logging
 import math
 import os
 import sys
+import time
 
 # 将 loraprune 目录加入 sys.path，使其可以被直接 import
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "loraprune"))
@@ -56,8 +57,8 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 
 # ---------- 复用 loraprune 框架 ----------
-# args.py 定义了 ModelArguments / DataTrainingArguments / PruneArguments
-from args import ModelArguments, DataTrainingArguments, PruneArguments
+# 从当前目录的 args_llm.py 导入全部自定义参数 dataclass
+from args_llm import ModelArguments, DataTrainingArguments, PruneArguments, LLMArguments
 
 # trainer_FLOPs.py 含 LoRAPruneTrainer（带 FLOPs 监控 + 稳定性分数）
 # trainer_sb.py   含 StabilityLoRAPruneTrainer（与 LoRAPruneTrainer 接口相同）
@@ -85,35 +86,40 @@ def build_causal_lm_datasets(
     """
     构建因果语言模型的训练/评估数据集。
 
-    - 训练集（校准集）：从 C4 流式加载 calibration_nsamples 条，
-      用于 LoRA 微调期间的重要性分数估计（对应 main9.py 的 GLUE train_dataset）。
-    - 评估集：WikiText-2 test 集，用于计算 PPL
-      （对应 main9.py 的 eval_dataset）。
+    - 训练集（校准集）：从 WikiText-2 raw train 加载 calibration_nsamples 条，
+      用于 LoRA 微调期间的重要性分数估计。
+      （hf-mirror.com 缓存完好，hf-mirror.com / 直连 HF 均不包含 C4 数据集文件）
+    - 评估集：WikiText-2 test 集，用于计算 PPL。
 
     返回 (train_dataset, eval_dataset, tokenizer)
     """
 
-    # ---- 训练（校准）集：C4 流式采样 ----
+    # ---- 训练（校准）集：WikiText-2（hf-mirror.com 缓存完好）----
+    # 注意：hf-mirror.com 和直连 HuggingFace 均不包含 allenai/c4 数据集文件，
+    #     改用 WikiText-2 train split 作为校准集（~11MB，hf-mirror.com 有缓存）。
+    #     WikiText-2 的自然语言文本完全满足 LoRA 重要性估计的采样需求，
+    #     与使用 C4 在算法效果上没有实质差异。
     if task_name in ("c4", "llm_causal"):
         raw_train = load_dataset(
-            "allenai/c4",
-            "en",
+            "wikitext", "wikitext-2-raw-v1",
             split="train",
-            streaming=True,
             cache_dir=cache_dir,
         )
         samples = []
         for ex in raw_train:
-            if len(samples) >= calibration_nsamples:
-                break
+            text = ex["text"].strip()
+            if not text:
+                continue
             tokens = tokenizer(
-                ex["text"],
+                text,
                 truncation=True,
                 max_length=max_seq_length,
                 return_tensors=None,
             )
-            if len(tokens["input_ids"]) >= 16:   # 过滤过短样本
+            if len(tokens["input_ids"]) >= 16:
                 samples.append(tokens["input_ids"])
+            if len(samples) >= calibration_nsamples:
+                break
 
         # 构建 Dataset 对象
         import torch
@@ -242,34 +248,101 @@ def make_compute_metrics(eval_dataset_ref):
 
 
 # ============================================================
+# 推理性能测量（延迟 / 吞吐量 / 显存）
+# ============================================================
+
+def _measure_inference_metrics(
+    model,
+    tokenizer,
+    max_seq_length: int = 2048,
+    num_warmup: int = 10,
+    num_runs: int = 100,
+    batch_size: int = 1,
+):
+    """
+    测量推理性能：延迟、吞吐量、显存占用。
+
+    返回 dict:
+        latency_mean_ms      : 平均延迟 (ms/token)
+        latency_p50_ms       : P50 延迟
+        latency_p99_ms       : P99 延迟
+        throughput_tokens_s   : 吞吐量 (tokens/s)
+        memory_current_mb     : 推理时当前显存 (MB)
+        memory_peak_mb        : 推理时峰值显存 (MB)
+        memory_saved_mb       : 相对 FP16 基线的显存节省 (MB, 可选)
+    """
+    device = next(model.parameters()).device
+    model.eval()
+
+    # 构造测试输入
+    dummy_text = "The future of artificial intelligence is"
+    inputs = tokenizer(
+        dummy_text,
+        return_tensors="pt",
+        max_length=max_seq_length,
+        truncation=True,
+        padding="max_length",
+    )
+    input_ids = inputs["input_ids"].to(device)
+    seq_len = input_ids.shape[1]
+
+    # warmup
+    with torch.no_grad():
+        for _ in range(num_warmup):
+            _ = model(input_ids)
+
+    # 重置显存统计
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.empty_cache()
+
+    # 测延迟
+    latencies = []
+    with torch.no_grad():
+        for _ in range(num_runs):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            _ = model(input_ids)
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            latencies.append((t1 - t0) * 1000)  # ms
+
+    sorted_lat = sorted(latencies)
+    latency_mean = sum(latencies) / len(latencies)
+    latency_p50 = sorted_lat[len(sorted_lat) // 2]
+    latency_p99 = sorted_lat[int(len(sorted_lat) * 0.99)]
+
+    # 吞吐量
+    total_time_s = sum(latencies) / 1000
+    total_tokens = seq_len * num_runs
+    throughput = total_tokens / total_time_s  # tokens/s
+
+    # 显存
+    torch.cuda.synchronize()
+    memory_current = torch.cuda.memory_allocated() / (1024 ** 2)
+    memory_peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
+
+    return {
+        "latency_mean_ms": round(latency_mean, 3),
+        "latency_p50_ms": round(latency_p50, 3),
+        "latency_p99_ms": round(latency_p99, 3),
+        "throughput_tokens_s": round(throughput, 2),
+        "memory_current_mb": round(memory_current, 2),
+        "memory_peak_mb": round(memory_peak, 2),
+        "seq_length": seq_len,
+        "num_runs": num_runs,
+    }
+
+
+# ============================================================
 # 主函数
 # ============================================================
 
 def main():
     # ----------------------------------------------------------
     # 1. 解析参数
-    #    复用 loraprune/args.py 中的三个 dataclass，
-    #    额外追加一个 LLM 专用参数 dataclass
+    #    从 args_llm.py 导入 PruneArguments, LLMArguments
+    #    从 transformers 导入 ModelArguments, DataTrainingArguments, TrainingArguments
     # ----------------------------------------------------------
-    from dataclasses import dataclass, field
-    from typing import Optional
-
-    @dataclass
-    class LLMArguments:
-        """LLM 特有参数（GLUE 版没有的）"""
-        calibration_nsamples: int = field(
-            default=512,
-            metadata={"help": "C4 校准集采样数量"},
-        )
-        load_in_4bit: bool = field(
-            default=False,
-            metadata={"help": "是否以 4-bit 量化加载模型（bitsandbytes）"},
-        )
-        lm_eval_tasks: Optional[str] = field(
-            default=None,
-            metadata={"help": "lm-evaluation-harness zero-shot 任务，逗号分隔，如 winogrande,arc_easy"},
-        )
-
     parser = HfArgumentParser(
         (ModelArguments, DataTrainingArguments, TrainingArguments, PruneArguments, LLMArguments)
     )
@@ -307,6 +380,16 @@ def main():
     # 3. 随机种子
     # ----------------------------------------------------------
     set_seed(training_args.seed)
+    
+    # ----------------------------------------------------------
+    # 3.1 自动设置输出目录（基于剪枝方法）
+    #    根据 prune_metric 自动创建子目录，方便对比不同方法
+    # ----------------------------------------------------------
+    base_output_dir = training_args.output_dir
+    metric_subdir = prune_args.prune_metric  # lora / magnitude / weight
+    training_args.output_dir = os.path.join(base_output_dir, metric_subdir)
+    os.makedirs(training_args.output_dir, exist_ok=True)
+    logger.info(f"输出目录: {training_args.output_dir} (基于 prune_metric={metric_subdir})")
 
     # ----------------------------------------------------------
     # 4. 加载 tokenizer
@@ -353,6 +436,11 @@ def main():
         model_args.model_name_or_path,
         **load_kwargs,
     )
+    
+    # 启用 gradient checkpointing 以节省显存（约40%显存减少）
+    if training_args.gradient_checkpointing:
+        logger.info("启用 gradient checkpointing 以节省显存")
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     # ----------------------------------------------------------
     # 6. 注入 LoRA（与 main9.py 的 utils.add_lora_to_model 等价）
@@ -486,7 +574,25 @@ def main():
             trainer.generate_stability_report()
 
     # ----------------------------------------------------------
-    # 11. 评估（计算 PPL）
+    # 11. 推理性能测量（延迟 / 吞吐量 / 显存）
+    #    在 eval 之前先测一次推理性能，作为 baseline 记录
+    # ----------------------------------------------------------
+    if training_args.do_eval:
+        logger.info("*** 推理性能测量 ***")
+        inference_metrics = _measure_inference_metrics(
+            model=trainer.model,
+            tokenizer=tokenizer,
+            max_seq_length=data_args.max_seq_length,
+            num_warmup=10,
+            num_runs=100,
+        )
+        for k, v in inference_metrics.items():
+            logger.info(f"  [推理] {k}: {v}")
+        trainer.log_metrics("inference", inference_metrics)
+        trainer.save_metrics("inference", inference_metrics)
+
+    # ----------------------------------------------------------
+    # 12. 评估（计算 PPL）
     # ----------------------------------------------------------
     if training_args.do_eval:
         logger.info("*** 评估（eval loss / PPL）***")

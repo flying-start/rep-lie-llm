@@ -1,0 +1,34 @@
+# REP-LIE 迁移 - 需复制文件清单
+# 复制这些文件到新服务器的 /root/autodl-tmp/rep-lie-llm/ 目录
+
+## 核心文件（必须）
+
+main_llm.py                  # 主入口
+args_llm.py                  # 参数定义
+loraprune/
+├── __init__.py
+├── trainer_FLOPs.py         # 核心训练器（已修复多个bug）
+├── trainer_sb.py            # 稳定性训练器
+├── utils.py                 # 工具函数（LLM兼容）
+└── utils1.py                # 额外工具
+
+## 依赖与环境
+
+requirements.txt             # pip 依赖
+requirements_autodl.txt      # AutoDL 专用依赖
+setup.sh                     # 一键安装脚本
+
+## 文档
+
+MIGRATION_GUIDE.md          # 详细迁移指南
+MIGRATION_CHECKLIST.md      # 迁移检查清单
+REP-LIE_LLM运行指南.md       # 运行说明
+
+## 模型路径映射（在新服务器上需要更新）
+
+# 编辑 main_llm.py 或运行时用 --model_name_or_path 指定
+
+旧路径 → 新路径
+------------------------------------------
+/root/autodl-tmp/models/AI-ModelScope/Mistral-7B-v0.1  → ???
+/root/autodl-tmp/models/shakechen/Llama-2-7b-hf         → ???

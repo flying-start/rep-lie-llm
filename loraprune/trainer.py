@@ -166,10 +166,10 @@ class LoRAPruneTrainer(Trainer):
                 debug_overflow = DebugUnderflowOverflow(self.model)  # noqa
 
         delay_optimizer_creation = (
-            self.sharded_ddp is not None
+            getattr(self, 'sharded_ddp', None) is not None
             and self.sharded_ddp != ShardedDDPOption.SIMPLE
             or is_sagemaker_mp_enabled()
-            or self.fsdp is not None
+            or getattr(self, 'fsdp', None) is not None
         )
         if args.deepspeed:
             deepspeed_engine, optimizer, lr_scheduler = deepspeed_init(
